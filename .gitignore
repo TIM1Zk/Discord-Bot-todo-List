@@ -1,2 +1,6 @@
 .env
+*.db
 todo_list.db
+__pycache__/
+*.pyc
+discloud.config

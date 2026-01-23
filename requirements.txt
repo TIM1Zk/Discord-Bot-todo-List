@@ -1,2 +1,4 @@
 discord.py
 python-dotenv
+pytz
+line-bot-sdk>=3.0.0

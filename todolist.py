@@ -18,6 +18,8 @@ from linebot.v3.messaging import (
 
 # --- การตั้งค่าเบื้องต้น ---
 load_dotenv()
+
+# ดึงค่า Token: รองรับทั้งแบบใส่ในโค้ดและดึงจากระบบ (Discloud)
 TOKEN = os.getenv('DISCORD_TOKEN')
 LINE_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_GROUP_ID = os.getenv('LINE_GROUP_ID')
@@ -29,7 +31,7 @@ def get_thai_date():
     tz = pytz.timezone('Asia/Bangkok')
     return datetime.now(tz).date()
 
-# ฟังก์ชันส่งการแจ้งเตือนไป LINE (รองรับการส่งข้อความยาวๆ)
+# ฟังก์ชันส่งการแจ้งเตือนไป LINE
 def send_to_line(message):
     if LINE_ACCESS_TOKEN and LINE_GROUP_ID:
         with ApiClient(configuration) as api_client:
@@ -58,12 +60,12 @@ cursor.execute('''
 ''')
 conn.commit()
 
-# ฟังก์ชันช่วยดึงลิสต์รายการทั้งหมดมาเป็นข้อความ
-def get_todo_list_text(user_id, today_str):
-    cursor.execute("SELECT task, status FROM todos WHERE user_id = ? AND created_at = ?", (user_id, today_str))
+# ฟังก์ชันดึงรายการรวมของทุกคนในวันนี้
+def get_todo_list_text(today_str):
+    cursor.execute("SELECT task, status FROM todos WHERE created_at = ?", (today_str,))
     rows = cursor.fetchall()
     if not rows:
-        return "ไม่มีรายการในขณะนี้"
+        return "📅 ยังไม่มีรายการใดๆ สำหรับวันนี้"
     
     text = ""
     for i, row in enumerate(rows, start=1):
@@ -72,9 +74,8 @@ def get_todo_list_text(user_id, today_str):
     return text
 
 class TodoView(discord.ui.View):
-    def __init__(self, user_id, rows):
+    def __init__(self, rows):
         super().__init__(timeout=300)
-        self.user_id = user_id
         for i, row in enumerate(rows, start=1):
             task_id, task, status = row
             if status == 'pending':
@@ -88,33 +89,32 @@ class TodoView(discord.ui.View):
 
     def create_callback(self, task_id, task_name):
         async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.user_id:
-                await interaction.response.send_message("❌ นี่ไม่ใช่รายการของคุณครับ", ephemeral=True)
-                return
+            # ใช้ defer เพื่อป้องกัน Unknown interaction error ขณะกดปุ่ม
+            await interaction.response.defer() 
             
             today_str = get_thai_date().isoformat()
-            cursor.execute("UPDATE todos SET status = 'done' WHERE id = ? AND user_id = ?", (task_id, self.user_id))
+            cursor.execute("UPDATE todos SET status = 'done' WHERE id = ?", (task_id,))
             conn.commit()
 
-            cursor.execute("SELECT COUNT(*) FROM todos WHERE user_id = ? AND created_at = ? AND status = 'pending'", (self.user_id, today_str))
+            cursor.execute("SELECT COUNT(*) FROM todos WHERE created_at = ? AND status = 'pending'", (today_str,))
             pending_count = cursor.fetchone()[0]
 
             if pending_count == 0:
-                send_to_line(f"🎊 ยินดีด้วย! ภารกิจวันนี้เสร็จสิ้นทั้งหมดแล้วครับ!\n(รายการล่าสุด: {task_name})")
-                cursor.execute("DELETE FROM todos WHERE user_id = ? AND created_at = ?", (self.user_id, today_str))
+                send_to_line(f"🎊 ยินดีด้วย! ภารกิจรวมวันนี้เสร็จสิ้นทั้งหมดแล้วครับ!\n(รายการล่าสุด: {task_name} โดย {interaction.user.display_name})")
+                cursor.execute("DELETE FROM todos WHERE created_at = ?", (today_str,))
                 conn.commit()
                 embed = discord.Embed(title="🎊 ภารกิจวันนี้เสร็จสิ้น!", color=discord.Color.gold())
-                await interaction.response.edit_message(embed=embed, view=None)
-                last_msg_ids.pop(self.user_id, None)
+                await interaction.followup.send(embed=embed)
+                last_msg_ids.clear() 
             else:
-                list_text = get_todo_list_text(self.user_id, today_str)
-                send_to_line(f"✅ ทำรายการสำเร็จ: {task_name}\n\n📝 ลิสต์ปัจจุบัน:\n{list_text}")
+                list_text = get_todo_list_text(today_str)
+                send_to_line(f"✅ {interaction.user.display_name} ทำรายการสำเร็จ: {task_name}\n\n📝 ลิสต์ปัจจุบัน:\n{list_text}")
                 
-                cursor.execute("SELECT id, task, status FROM todos WHERE user_id = ? AND created_at = ?", (self.user_id, today_str))
+                cursor.execute("SELECT id, task, status FROM todos WHERE created_at = ?", (today_str,))
                 updated_rows = cursor.fetchall()
-                embed = discord.Embed(title="📝 To-do List อัปเดตล่าสุด", color=discord.Color.green())
+                embed = discord.Embed(title="📝 To-do List รวม (อัปเดตล่าสุด)", color=discord.Color.green())
                 embed.description = list_text
-                await interaction.response.edit_message(embed=embed, view=TodoView(self.user_id, updated_rows))
+                await interaction.edit_original_response(embed=embed, view=TodoView(updated_rows))
         return callback
 
 class MyBot(commands.Bot):
@@ -129,59 +129,58 @@ bot = MyBot()
 
 # --- Slash Commands ---
 
-@bot.tree.command(name="add", description="เพิ่มรายการและส่งลิสต์ไป LINE")
+@bot.tree.command(name="add", description="เพิ่มรายการลงในลิสต์รวม")
 async def add(interaction: discord.Interaction, task: str):
     await interaction.response.defer(ephemeral=True)
-    user_id = interaction.user.id
     today_str = get_thai_date().isoformat()
     
-    # ลบข้อความเก่าในแชนเนล Discord
-    if user_id in last_msg_ids:
+    if 'global' in last_msg_ids:
         try:
-            old_msg = await interaction.channel.fetch_message(last_msg_ids[user_id])
+            old_msg = await interaction.channel.fetch_message(last_msg_ids['global'])
             await old_msg.delete()
         except: pass
 
-    cursor.execute("INSERT INTO todos (user_id, task, status, created_at) VALUES (?, ?, ?, ?)", (user_id, task, 'pending', today_str))
+    cursor.execute("INSERT INTO todos (user_id, task, status, created_at) VALUES (?, ?, ?, ?)", 
+                   (interaction.user.id, task, 'pending', today_str))
     conn.commit()
 
-    # ดึงลิสต์ทั้งหมดส่งไป LINE
-    current_list = get_todo_list_text(user_id, today_str)
-    send_to_line(f"📌 เพิ่มงานใหม่: {task}\n\n📝 รายการทั้งหมดวันนี้:\n{current_list}")
+    current_list = get_todo_list_text(today_str)
+    send_to_line(f"📌 {interaction.user.display_name} เพิ่มงานใหม่: {task}\n\n📝 รายการรวมทั้งหมดวันนี้:\n{current_list}")
 
-    cursor.execute("SELECT id, task, status FROM todos WHERE user_id = ? AND created_at = ?", (user_id, today_str))
+    cursor.execute("SELECT id, task, status FROM todos WHERE created_at = ?", (today_str,))
     rows = cursor.fetchall()
-    embed = discord.Embed(title="📝 To-do List ปัจจุบัน", description=current_list, color=discord.Color.blue())
+    embed = discord.Embed(title="📝 To-do List รวม (ปัจจุบัน)", description=current_list, color=discord.Color.blue())
     
     await interaction.followup.send(f"✅ เพิ่มรายการ '**{task}**' แล้ว", ephemeral=True)
-    new_msg = await interaction.channel.send(embed=embed, view=TodoView(user_id, rows))
-    last_msg_ids[user_id] = new_msg.id
+    new_msg = await interaction.channel.send(embed=embed, view=TodoView(rows))
+    last_msg_ids['global'] = new_msg.id
 
-@bot.tree.command(name="list", description="ดูรายการ To-do ทั้งหมด")
+@bot.tree.command(name="list", description="ดูรายการ To-do รวมของทุกคน")
 async def list_todo(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    today_str = get_thai_date().isoformat()
+    # ใช้ defer เพื่อขยายเวลาตอบกลับ ป้องกัน Error 10062
+    await interaction.response.defer(ephemeral=True) 
     
-    cursor.execute("SELECT id, task, status FROM todos WHERE user_id = ? AND created_at = ?", (user_id, today_str))
+    today_str = get_thai_date().isoformat()
+    cursor.execute("SELECT id, task, status FROM todos WHERE created_at = ?", (today_str,))
     rows = cursor.fetchall()
     
     if not rows:
-        await interaction.response.send_message("📅 ยังไม่มีรายการสำหรับวันนี้", ephemeral=True)
+        await interaction.followup.send("📅 ยังไม่มีรายการสำหรับวันนี้", ephemeral=True)
         return
 
-    list_text = get_todo_list_text(user_id, today_str)
-    embed = discord.Embed(title="📝 รายการ To-do ของคุณ", description=list_text, color=discord.Color.blue())
-    await interaction.response.send_message(embed=embed, view=TodoView(user_id, rows), ephemeral=True)
+    list_text = get_todo_list_text(today_str)
+    embed = discord.Embed(title="📝 รายการ To-do รวมของทุกคน", description=list_text, color=discord.Color.blue())
+    await interaction.followup.send(embed=embed, view=TodoView(rows), ephemeral=True)
 
-@bot.tree.command(name="clear", description="ล้างรายการทั้งหมดของวันนี้")
+@bot.tree.command(name="clear", description="ล้างรายการรวมทั้งหมดของวันนี้")
 async def clear(interaction: discord.Interaction):
-    user_id = interaction.user.id
+    await interaction.response.defer(ephemeral=True)
     today_str = get_thai_date().isoformat()
-    
-    cursor.execute("DELETE FROM todos WHERE user_id = ? AND created_at = ?", (user_id, today_str))
+    cursor.execute("DELETE FROM todos WHERE created_at = ?", (today_str,))
     conn.commit()
     
-    send_to_line("🗑️ รายการ To-do ทั้งหมดถูกล้างเรียบร้อยแล้ว")
-    await interaction.response.send_message("🗑️ ล้างรายการของวันนี้ทั้งหมดแล้ว", ephemeral=True)
+    send_to_line(f"🗑️ {interaction.user.display_name} ล้างรายการ To-do ทั้งหมดเรียบร้อยแล้ว")
+    await interaction.followup.send("🗑️ ล้างรายการรวมของวันนี้ทั้งหมดแล้ว", ephemeral=True)
 
-bot.run(TOKEN)
+if TOKEN:
+    bot.run(TOKEN)
